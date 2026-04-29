@@ -293,6 +293,7 @@ body {
 .alert-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .dot-red { background: var(--red); }
 .dot-amber { background: var(--amber); }
+.dot-gray { background: var(--text-3); }
 .alert-info { flex: 1; }
 .alert-name { font-size: 13px; font-weight: 500; color: var(--text); }
 .alert-sub { font-size: 11px; color: var(--text-3); margin-top: 1px; }

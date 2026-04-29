@@ -11,11 +11,7 @@
     const upper = letter.toUpperCase();
     let n = 0;
     for (let i = 0; i < upper.length; i++) n = n * 26 + upper.charCodeAt(i) - 64;
-    return n - 1; // 0-based index
-  }
-
-  function colIdx(key, colMap) {
-    return colLetter(colMap[key]);
+    return n - 1;
   }
 
   function getCell(row, letter) {
@@ -28,18 +24,12 @@
     return isNaN(n) ? 0 : n;
   }
 
-  function daysStatus(days) {
-    if (days === null) return { label: 'Out / N/A', cls: 'badge-gray' };
+  function daysStatus(days, available) {
+    if (available <= 0) return { label: 'Out / N/A', cls: 'badge-gray' };
+    if (days === null) return { label: 'No forecast', cls: 'badge-gray' };
     if (days <= S.criticalDays) return { label: 'Critical', cls: 'badge-red' };
     if (days <= S.lowDays) return { label: 'Low', cls: 'badge-amber' };
     return { label: 'Healthy', cls: 'badge-green' };
-  }
-
-  function stockoutDate(days) {
-    if (days === null || days < 0) return '—';
-    const d = new Date();
-    d.setDate(d.getDate() + Math.round(days));
-    return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
   }
 
   function fmtDate(d) {
@@ -72,23 +62,28 @@
       const available = toNum(getCell(r, mc.available));
       const committed = toNum(getCell(r, mc.committed));
       const totalPipeline = toNum(getCell(r, mc.totalPipeline));
-
-      // Derive product family from name (everything before the dash)
       const family = name.includes(' - ') ? name.split(' - ')[0].trim() : name;
 
-      products.push({ name, sku, type, family, available, committed, totalPipeline, status });
+      products.push({ name, sku, type, family, available, committed, totalPipeline });
     }
     return products;
   }
 
   // ── Parse Depletion Model ────────────────────
-  function parseDepletion(rows) {
+  // Weekly values = stock remaining at END of that week.
+  // e.g. current stock = 709, week1 end = 665 → sold 44 that week → 6.3/day
+  // Stockout = first week where stock hits 0 or goes negative.
+  // Days until stockout = calendar days from today to that week's date header.
+  function parseDepletion(rows, currentProducts) {
     if (!rows.length) return { headers: [], items: [] };
 
-    // Row 1 = headers (product, status, sku, date1, date2, ...)
     const headerRow = rows[0];
     const weekStart = colLetter(C.DEPL_COLS.weekStart);
     const dateHeaders = headerRow.slice(weekStart).map(h => h.trim()).filter(Boolean);
+
+    // Build stock lookup from Main_Dashboard for rate calculation
+    const stockLookup = {};
+    currentProducts.forEach(p => { stockLookup[p.name] = p.available; });
 
     const items = [];
     for (let i = S.deplDataStartRow - 1; i < rows.length; i++) {
@@ -98,48 +93,100 @@
       const sku = getCell(r, C.DEPL_COLS.sku);
       if (!name) continue;
 
+      // week-end inventory values
       const weekly = r.slice(weekStart).map(v => toNum(v));
 
-      // Calculate daily depletion rate from first two non-null week values
+      const avail = stockLookup[name] ?? null;
+
+      // Daily rate: prefer current stock → week1 end (most accurate for current week)
+      // Fall back to week-over-week diffs
       let deplRate = null;
-      for (let w = 0; w < weekly.length - 1; w++) {
-        const diff = weekly[w] - weekly[w + 1];
-        if (weekly[w] > 0 && diff > 0) {
-          deplRate = diff / 7;
+      if (avail !== null && weekly.length > 0) {
+        const thisWeekSales = avail - weekly[0];
+        if (thisWeekSales > 0) {
+          deplRate = thisWeekSales / 7;
+        }
+      }
+      if (deplRate === null) {
+        for (let w = 0; w < weekly.length - 1; w++) {
+          const diff = weekly[w] - weekly[w + 1];
+          if (weekly[w] > 0 && diff > 0) {
+            deplRate = diff / 7;
+            break;
+          }
+        }
+      }
+
+      // Stockout: first week where week-end stock <= 0
+      let stockoutWeekIdx = null;
+      let stockoutDateStr = null;
+      let daysUntilStockout = null;
+
+      for (let w = 0; w < weekly.length; w++) {
+        if (weekly[w] <= 0) {
+          stockoutWeekIdx = w;
+          stockoutDateStr = dateHeaders[w] || null;
           break;
         }
       }
 
-      // Find stockout week (first week where value hits 0 or goes negative)
-      let stockoutWeekIdx = null;
-      for (let w = 0; w < weekly.length; w++) {
-        if (weekly[w] <= 0) { stockoutWeekIdx = w; break; }
+      // Calculate calendar days from today to stockout date
+      if (stockoutDateStr) {
+        const stockoutD = new Date(stockoutDateStr);
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        daysUntilStockout = Math.max(0, Math.round((stockoutD - today) / (1000 * 60 * 60 * 24)));
       }
 
       const family = name.includes(' - ') ? name.split(' - ')[0].trim() : name;
 
-      items.push({ name, sku, family, weekly, deplRate, stockoutWeekIdx, dateHeaders });
+      items.push({
+        name, sku, family, weekly, dateHeaders,
+        deplRate,
+        stockoutWeekIdx,
+        stockoutDateStr,
+        daysUntilStockout,
+      });
     }
     return { headers: dateHeaders, items };
   }
 
-  // ── Compute days remaining from depletion data ─
+  // ── Enrich products with depletion data ───────
   function enrichWithDays(products, deplItems) {
     const deplMap = {};
     deplItems.forEach(d => { deplMap[d.name] = d; });
 
     return products.map(p => {
-      const depl = deplMap[p.name];
-      let days = null;
-      let deplRate = null;
-
-      if (depl && depl.deplRate !== null) {
-        deplRate = depl.deplRate;
-        const netStock = Math.max(0, p.available + p.committed);
-        days = deplRate > 0 ? Math.round(netStock / deplRate) : null;
+      // 0-stock SKUs: always Out/NA
+      if (p.available <= 0) {
+        return {
+          ...p,
+          days: null,
+          deplRate: deplMap[p.name]?.deplRate ?? null,
+          stockoutDateStr: 'Out of stock',
+          status: daysStatus(null, 0),
+        };
       }
 
-      return { ...p, days, deplRate, status: daysStatus(days) };
+      const depl = deplMap[p.name];
+      if (!depl) {
+        return {
+          ...p,
+          days: null,
+          deplRate: null,
+          stockoutDateStr: null,
+          status: daysStatus(null, p.available),
+        };
+      }
+
+      return {
+        ...p,
+        days: depl.daysUntilStockout,
+        deplRate: depl.deplRate,
+        stockoutDateStr: depl.stockoutDateStr,
+        stockoutWeekIdx: depl.stockoutWeekIdx,
+        status: daysStatus(depl.daysUntilStockout, p.available),
+      };
     });
   }
 
@@ -156,10 +203,11 @@
   // ── Render: Metrics ───────────────────────────
   function renderMetrics() {
     const p = state.products;
-    const active = p.filter(x => x.days !== null);
-    const critical = active.filter(x => x.days <= S.criticalDays).length;
-    const low = active.filter(x => x.days > S.criticalDays && x.days <= S.lowDays).length;
-    const healthy = active.filter(x => x.days > S.lowDays).length;
+    const withForecast = p.filter(x => x.available > 0 && x.days !== null);
+    const critical = withForecast.filter(x => x.days <= S.criticalDays).length;
+    const low = withForecast.filter(x => x.days > S.criticalDays && x.days <= S.lowDays).length;
+    const healthy = withForecast.filter(x => x.days > S.lowDays).length;
+    const outOfStock = p.filter(x => x.available <= 0).length;
     const totalStock = p.reduce((s, x) => s + x.available, 0);
 
     document.getElementById('metricsGrid').innerHTML = `
@@ -179,34 +227,42 @@
         <div class="metric-sub">${S.criticalDays}–${S.lowDays} days stock</div>
       </div>
       <div class="metric-card crit">
-        <div class="metric-label">Critical</div>
-        <div class="metric-value">${critical}</div>
-        <div class="metric-sub">≤ ${S.criticalDays} days stock</div>
+        <div class="metric-label">Critical / Out</div>
+        <div class="metric-value">${critical + outOfStock}</div>
+        <div class="metric-sub">≤ ${S.criticalDays} days or out of stock</div>
       </div>
     `;
   }
 
   // ── Render: Urgency chart ─────────────────────
   function renderUrgencyChart() {
-    const items = state.products
-      .filter(x => x.days !== null && x.deplRate > 0)
-      .sort((a, b) => a.days - b.days)
-      .slice(0, S.maxTimelineItems);
+    const withDays = state.products
+      .filter(x => x.available > 0 && x.days !== null)
+      .sort((a, b) => a.days - b.days);
 
-    const maxDays = Math.max(...items.map(x => x.days), 1);
+    const beyondForecast = state.products
+      .filter(x => x.available > 0 && x.days === null && x.deplRate !== null);
+
+    const items = [...withDays, ...beyondForecast].slice(0, S.maxTimelineItems);
+    const maxDays = Math.max(...withDays.map(x => x.days), 1);
 
     document.getElementById('urgencyChart').innerHTML = items.map(x => {
-      const pct = Math.min(100, Math.round((x.days / maxDays) * 100));
-      const colorClass = x.days <= S.criticalDays ? 'bar-red' : x.days <= S.lowDays ? 'bar-amber' : 'bar-green';
+      const hasDays = x.days !== null;
+      const pct = hasDays ? Math.min(100, Math.round((x.days / maxDays) * 100)) : 100;
+      const colorClass = !hasDays ? 'bar-green'
+        : x.days <= S.criticalDays ? 'bar-red'
+        : x.days <= S.lowDays ? 'bar-amber'
+        : 'bar-green';
+      const label = hasDays ? (x.stockoutDateStr || `${x.days}d`) : 'Beyond forecast window';
       return `
         <div class="urgency-row">
           <div class="urgency-label" title="${x.name}">${x.name}</div>
           <div class="urgency-track">
-            <div class="urgency-fill ${colorClass}" style="width:${Math.max(pct, 3)}%">
-              <span class="urgency-date">${stockoutDate(x.days)}</span>
+            <div class="urgency-fill ${colorClass}" style="width:${Math.max(pct, 4)}%">
+              <span class="urgency-date">${label}</span>
             </div>
           </div>
-          <div class="urgency-days">${x.days}d</div>
+          <div class="urgency-days">${hasDays ? x.days + 'd' : '✓'}</div>
         </div>`;
     }).join('');
   }
@@ -215,9 +271,10 @@
   function renderFamilyList() {
     const families = {};
     state.products.forEach(p => {
-      if (!families[p.family]) families[p.family] = { total: 0, critical: 0 };
+      if (!families[p.family]) families[p.family] = { total: 0, critical: 0, out: 0 };
       families[p.family].total += p.available;
-      if (p.days !== null && p.days <= S.criticalDays) families[p.family].critical++;
+      if (p.available <= 0) families[p.family].out++;
+      else if (p.days !== null && p.days <= S.criticalDays) families[p.family].critical++;
     });
 
     document.getElementById('familyList').innerHTML = Object.entries(families).map(([name, f]) => `
@@ -225,7 +282,11 @@
         <div class="family-name">${name}</div>
         <div class="family-right">
           <div class="family-stock">${f.total.toLocaleString()} units</div>
-          ${f.critical > 0 ? `<span class="badge badge-red">${f.critical} critical</span>` : '<span class="badge badge-green">OK</span>'}
+          ${f.critical > 0
+            ? `<span class="badge badge-red">${f.critical} critical</span>`
+            : f.out > 0
+            ? `<span class="badge badge-gray">${f.out} out</span>`
+            : '<span class="badge badge-green">OK</span>'}
         </div>
       </div>
     `).join('');
@@ -233,25 +294,36 @@
 
   // ── Render: Alerts ────────────────────────────
   function renderAlerts() {
-    const alerts = state.products
-      .filter(x => x.days !== null && x.days <= S.lowDays)
+    const outOfStock = state.products.filter(x => x.available <= 0);
+    const lowStock = state.products
+      .filter(x => x.available > 0 && x.days !== null && x.days <= S.lowDays)
       .sort((a, b) => a.days - b.days);
+
+    const alerts = [...lowStock, ...outOfStock];
 
     if (!alerts.length) {
       document.getElementById('alertsList').innerHTML = `<div class="no-alerts">All SKUs are well stocked</div>`;
       return;
     }
 
-    document.getElementById('alertsList').innerHTML = alerts.map(x => `
-      <div class="alert-row">
-        <div class="alert-dot ${x.days <= S.criticalDays ? 'dot-red' : 'dot-amber'}"></div>
-        <div class="alert-info">
-          <div class="alert-name">${x.name}</div>
-          <div class="alert-sub">Stockout ${stockoutDate(x.days)} · ${x.available.toLocaleString()} units left</div>
-        </div>
-        <div class="alert-days ${x.days <= S.criticalDays ? 'text-red' : 'text-amber'}">${x.days}d</div>
-      </div>
-    `).join('');
+    document.getElementById('alertsList').innerHTML = alerts.map(x => {
+      const isOut = x.available <= 0;
+      const dotCls = isOut ? 'dot-gray' : x.days <= S.criticalDays ? 'dot-red' : 'dot-amber';
+      const daysLabel = isOut ? 'Out' : `${x.days}d`;
+      const daysColor = isOut ? '' : x.days <= S.criticalDays ? 'text-red' : 'text-amber';
+      const sub = isOut
+        ? 'No stock on hand'
+        : `Stockout ${x.stockoutDateStr || '—'} · ${x.available.toLocaleString()} units left`;
+      return `
+        <div class="alert-row">
+          <div class="alert-dot ${dotCls}"></div>
+          <div class="alert-info">
+            <div class="alert-name">${x.name}</div>
+            <div class="alert-sub">${sub}</div>
+          </div>
+          <div class="alert-days ${daysColor}">${daysLabel}</div>
+        </div>`;
+    }).join('');
   }
 
   // ── Render: Depletion timeline ────────────────
@@ -261,33 +333,32 @@
       `<button class="pill ${f === state.deplFilter ? 'pill-active' : ''}" onclick="window.dashboard.setDeplFilter('${f}')">${f}</button>`
     ).join('');
 
+    const totalWeeks = state.deplData.headers.length;
     const items = state.deplData.items
       .filter(d => state.deplFilter === 'All' || d.family === state.deplFilter)
-      .filter(d => d.deplRate !== null && d.deplRate > 0)
-      .sort((a, b) => (a.stockoutWeekIdx ?? 999) - (b.stockoutWeekIdx ?? 999))
-      .slice(0, S.maxTimelineItems);
-
-    const totalWeeks = state.deplData.headers.length;
+      .sort((a, b) => (a.stockoutWeekIdx ?? 999) - (b.stockoutWeekIdx ?? 999));
 
     document.getElementById('depletionTimeline').innerHTML = `
       <div class="timeline-grid">
         ${items.map(item => {
-          const runoutAt = item.stockoutWeekIdx !== null ? item.stockoutWeekIdx : totalWeeks;
+          const runoutAt = item.stockoutWeekIdx !== null ? item.stockoutWeekIdx + 1 : totalWeeks;
           const pct = Math.min(100, Math.round((runoutAt / totalWeeks) * 100));
-          const cls = runoutAt <= 2 ? 'bar-red' : runoutAt <= 4 ? 'bar-amber' : 'bar-green';
+          const cls = item.stockoutWeekIdx !== null && item.stockoutWeekIdx <= 2 ? 'bar-red'
+            : item.stockoutWeekIdx !== null && item.stockoutWeekIdx <= 4 ? 'bar-amber'
+            : 'bar-green';
+          const label = item.stockoutDateStr || 'Beyond forecast';
           return `
             <div class="urgency-row">
               <div class="urgency-label" title="${item.name}">${item.name}</div>
               <div class="urgency-track">
                 <div class="urgency-fill ${cls}" style="width:${Math.max(pct, 3)}%">
-                  <span class="urgency-date">${item.stockoutWeekIdx !== null ? item.dateHeaders[item.stockoutWeekIdx] || '—' : 'Beyond forecast'}</span>
+                  <span class="urgency-date">${label}</span>
                 </div>
               </div>
               <div class="urgency-days">${item.stockoutWeekIdx !== null ? 'Wk ' + (item.stockoutWeekIdx + 1) : '✓'}</div>
             </div>`;
         }).join('')}
-      </div>
-    `;
+      </div>`;
   }
 
   // ── Render: Depletion table ───────────────────
@@ -296,7 +367,6 @@
     const items = state.deplData.items
       .filter(d => state.deplFilter === 'All' || d.family === state.deplFilter);
 
-    // Show max 8 week columns to keep it readable
     const visibleHeaders = headers.slice(0, 8);
 
     document.getElementById('deplTableHead').innerHTML =
@@ -305,7 +375,8 @@
 
     document.getElementById('deplTableBody').innerHTML = items.map(item => {
       const cells = visibleHeaders.map((_, wi) => {
-        const val = item.weekly[wi];
+        const val = item.weekly[wi] ?? null;
+        if (val === null) return `<td class="num">—</td>`;
         const cls = val <= 0 ? 'cell-red' : val <= 20 ? 'cell-amber' : '';
         return `<td class="num ${cls}">${val <= 0 ? '0' : val.toLocaleString()}</td>`;
       }).join('');
@@ -325,25 +396,31 @@
       .filter(p => state.skuFilter === 'All' || p.family === state.skuFilter)
       .filter(p => !q || p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q))
       .sort((a, b) => {
-        if (a.days === null && b.days === null) return 0;
-        if (a.days === null) return 1;
-        if (b.days === null) return -1;
-        return a.days - b.days;
+        if (a.available <= 0 && b.available > 0) return 1;
+        if (b.available <= 0 && a.available > 0) return -1;
+        if (a.days !== null && b.days !== null) return a.days - b.days;
+        if (a.days === null && b.days !== null) return 1;
+        if (b.days === null && a.days !== null) return -1;
+        return 0;
       });
 
-    document.getElementById('skuBody').innerHTML = rows.map(p => `
-      <tr>
-        <td class="td-name">${p.name}</td>
-        <td class="td-sku">${p.sku}</td>
-        <td class="num">${p.available.toLocaleString()}</td>
-        <td class="num ${p.committed < 0 ? 'text-amber' : ''}">${p.committed}</td>
-        <td class="num">${Math.max(0, p.available + p.committed).toLocaleString()}</td>
-        <td class="num">${p.deplRate ? p.deplRate.toFixed(1) : '—'}</td>
-        <td class="num fw-500">${p.days !== null ? p.days + 'd' : '—'}</td>
-        <td class="num">${stockoutDate(p.days)}</td>
-        <td><span class="badge ${p.status.cls}">${p.status.label}</span></td>
-      </tr>
-    `).join('');
+    document.getElementById('skuBody').innerHTML = rows.map(p => {
+      const isOut = p.available <= 0;
+      const daysCell = isOut ? '—' : p.days !== null ? `${p.days}d` : '—';
+      const stockoutCell = isOut ? 'Out of stock' : p.stockoutDateStr || 'Beyond forecast';
+      return `
+        <tr>
+          <td class="td-name">${p.name}</td>
+          <td class="td-sku">${p.sku}</td>
+          <td class="num">${p.available.toLocaleString()}</td>
+          <td class="num ${p.committed < 0 ? 'text-amber' : ''}">${p.committed}</td>
+          <td class="num">${Math.max(0, p.available + p.committed).toLocaleString()}</td>
+          <td class="num">${p.deplRate ? p.deplRate.toFixed(1) : '—'}</td>
+          <td class="num fw-500">${daysCell}</td>
+          <td class="num">${stockoutCell}</td>
+          <td><span class="badge ${p.status.cls}">${p.status.label}</span></td>
+        </tr>`;
+    }).join('');
   }
 
   // ── View switching ────────────────────────────
@@ -360,7 +437,6 @@
   // ── Load data ─────────────────────────────────
   async function loadData() {
     setLoader(true, 'Connecting to inventory...');
-
     try {
       setLoader(true, 'Fetching main dashboard...');
       const mainRows = await fetchRange(C.TABS.main, 'A:N');
@@ -369,7 +445,7 @@
       const deplRows = await fetchRange(C.TABS.depletion, 'A:V');
 
       const rawProducts = parseMain(mainRows);
-      const deplData = parseDepletion(deplRows);
+      const deplData = parseDepletion(deplRows, rawProducts);
       const products = enrichWithDays(rawProducts, deplData.items);
 
       state.products = products;
@@ -384,7 +460,6 @@
       document.getElementById('headerDate').textContent = fmtDate(new Date());
 
       setLoader(false);
-
     } catch (err) {
       console.error(err);
       document.getElementById('loader').style.display = 'none';
