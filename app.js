@@ -71,17 +71,22 @@
 
   // ── Parse Depletion Model ────────────────────
   // Weekly values = stock remaining at END of that week.
-  // e.g. current stock = 709, week1 end = 665 → sold 44 that week → 6.3/day
-  // Stockout = first week where stock hits 0 or goes negative.
-  // Days until stockout = calendar days from today to that week's date header.
+  // Stockout   = first week where stock hits 0 or goes negative.
+  // End of forecast = forecastEndCol in config — if stock is still positive
+  //   at that column, we show "[remaining units] units remaining at [last date]".
   function parseDepletion(rows, currentProducts) {
     if (!rows.length) return { headers: [], items: [] };
 
     const headerRow = rows[0];
-    const weekStart = colLetter(C.DEPL_COLS.weekStart);
-    const dateHeaders = headerRow.slice(weekStart).map(h => h.trim()).filter(Boolean);
+    const weekStartIdx = colLetter(C.DEPL_COLS.weekStart);
+    const forecastEndIdx = colLetter(C.DEPL_COLS.forecastEndCol);
 
-    // Build stock lookup from Main_Dashboard for rate calculation
+    // Slice headers only between weekStart and forecastEndCol (inclusive)
+    const dateHeaders = headerRow
+      .slice(weekStartIdx, forecastEndIdx + 1)
+      .map(h => h.trim())
+      .filter(Boolean);
+
     const stockLookup = {};
     currentProducts.forEach(p => { stockLookup[p.name] = p.available; });
 
@@ -93,31 +98,27 @@
       const sku = getCell(r, C.DEPL_COLS.sku);
       if (!name) continue;
 
-      // week-end inventory values
-      const weekly = r.slice(weekStart).map(v => toNum(v));
+      // Only read up to forecastEndCol
+      const weekly = r
+        .slice(weekStartIdx, forecastEndIdx + 1)
+        .map(v => toNum(v));
 
       const avail = stockLookup[name] ?? null;
 
-      // Daily rate: prefer current stock → week1 end (most accurate for current week)
-      // Fall back to week-over-week diffs
+      // Daily rate: current stock → first week-end value ÷ 7
       let deplRate = null;
       if (avail !== null && weekly.length > 0) {
         const thisWeekSales = avail - weekly[0];
-        if (thisWeekSales > 0) {
-          deplRate = thisWeekSales / 7;
-        }
+        if (thisWeekSales > 0) deplRate = thisWeekSales / 7;
       }
       if (deplRate === null) {
         for (let w = 0; w < weekly.length - 1; w++) {
           const diff = weekly[w] - weekly[w + 1];
-          if (weekly[w] > 0 && diff > 0) {
-            deplRate = diff / 7;
-            break;
-          }
+          if (weekly[w] > 0 && diff > 0) { deplRate = diff / 7; break; }
         }
       }
 
-      // Stockout: first week where week-end stock <= 0
+      // Find stockout week (first week where stock hits 0 or negative)
       let stockoutWeekIdx = null;
       let stockoutDateStr = null;
       let daysUntilStockout = null;
@@ -130,12 +131,30 @@
         }
       }
 
-      // Calculate calendar days from today to stockout date
+      // If stockout found — calculate calendar days to that date
       if (stockoutDateStr) {
         const stockoutD = new Date(stockoutDateStr);
         const today = new Date();
         today.setHours(0, 0, 0, 0);
         daysUntilStockout = Math.max(0, Math.round((stockoutD - today) / (1000 * 60 * 60 * 24)));
+      }
+
+      // If NO stockout found within forecast window — stock is healthy through the end
+      // Record the last week's remaining units and date so we can display it
+      let forecastEndStock = null;
+      let forecastEndDate = null;
+      if (stockoutWeekIdx === null && weekly.length > 0) {
+        const lastVal = weekly[weekly.length - 1];
+        const lastDate = dateHeaders[dateHeaders.length - 1];
+        if (lastVal > 0) {
+          forecastEndStock = lastVal;
+          forecastEndDate = lastDate;
+          // Estimate days using rate beyond forecast window
+          if (deplRate && deplRate > 0) {
+            daysUntilStockout = Math.round(lastVal / deplRate) +
+              Math.round((new Date(lastDate) - new Date()) / (1000 * 60 * 60 * 24));
+          }
+        }
       }
 
       const family = name.includes(' - ') ? name.split(' - ')[0].trim() : name;
@@ -146,6 +165,9 @@
         stockoutWeekIdx,
         stockoutDateStr,
         daysUntilStockout,
+        forecastEndStock,
+        forecastEndDate,
+        beyondForecast: stockoutWeekIdx === null && forecastEndStock !== null,
       });
     }
     return { headers: dateHeaders, items };
@@ -157,13 +179,15 @@
     deplItems.forEach(d => { deplMap[d.name] = d; });
 
     return products.map(p => {
-      // 0-stock SKUs: always Out/NA
       if (p.available <= 0) {
         return {
           ...p,
           days: null,
           deplRate: deplMap[p.name]?.deplRate ?? null,
           stockoutDateStr: 'Out of stock',
+          beyondForecast: false,
+          forecastEndStock: null,
+          forecastEndDate: null,
           status: daysStatus(null, 0),
         };
       }
@@ -171,10 +195,9 @@
       const depl = deplMap[p.name];
       if (!depl) {
         return {
-          ...p,
-          days: null,
-          deplRate: null,
-          stockoutDateStr: null,
+          ...p, days: null, deplRate: null,
+          stockoutDateStr: null, beyondForecast: false,
+          forecastEndStock: null, forecastEndDate: null,
           status: daysStatus(null, p.available),
         };
       }
@@ -185,9 +208,23 @@
         deplRate: depl.deplRate,
         stockoutDateStr: depl.stockoutDateStr,
         stockoutWeekIdx: depl.stockoutWeekIdx,
+        beyondForecast: depl.beyondForecast,
+        forecastEndStock: depl.forecastEndStock,
+        forecastEndDate: depl.forecastEndDate,
         status: daysStatus(depl.daysUntilStockout, p.available),
       };
     });
+  }
+
+  // ── Format the stockout/horizon label ─────────
+  // Used consistently across all views
+  function stockoutLabel(p) {
+    if (p.available <= 0) return 'Out of stock';
+    if (p.beyondForecast && p.forecastEndStock !== null) {
+      return `${p.forecastEndStock.toLocaleString()} units at ${p.forecastEndDate}`;
+    }
+    if (p.stockoutDateStr) return p.stockoutDateStr;
+    return '—';
   }
 
   // ── State ─────────────────────────────────────
@@ -236,33 +273,37 @@
 
   // ── Render: Urgency chart ─────────────────────
   function renderUrgencyChart() {
+    // SKUs with a known stockout date — sorted soonest first
     const withDays = state.products
-      .filter(x => x.available > 0 && x.days !== null)
+      .filter(x => x.available > 0 && x.days !== null && !x.beyondForecast)
       .sort((a, b) => a.days - b.days);
 
-    const beyondForecast = state.products
-      .filter(x => x.available > 0 && x.days === null && x.deplRate !== null);
+    // SKUs healthy beyond forecast window — sorted by remaining stock desc
+    const beyond = state.products
+      .filter(x => x.available > 0 && x.beyondForecast)
+      .sort((a, b) => (b.forecastEndStock || 0) - (a.forecastEndStock || 0));
 
-    const items = [...withDays, ...beyondForecast].slice(0, S.maxTimelineItems);
+    const items = [...withDays, ...beyond].slice(0, S.maxTimelineItems);
     const maxDays = Math.max(...withDays.map(x => x.days), 1);
 
     document.getElementById('urgencyChart').innerHTML = items.map(x => {
-      const hasDays = x.days !== null;
-      const pct = hasDays ? Math.min(100, Math.round((x.days / maxDays) * 100)) : 100;
-      const colorClass = !hasDays ? 'bar-green'
+      const pct = x.beyondForecast
+        ? 100
+        : Math.min(100, Math.round((x.days / maxDays) * 100));
+      const colorClass = x.beyondForecast ? 'bar-green'
         : x.days <= S.criticalDays ? 'bar-red'
         : x.days <= S.lowDays ? 'bar-amber'
         : 'bar-green';
-      const label = hasDays ? (x.stockoutDateStr || `${x.days}d`) : 'Beyond forecast window';
+      const rightLabel = x.beyondForecast ? '✓' : `${x.days}d`;
       return `
         <div class="urgency-row">
           <div class="urgency-label" title="${x.name}">${x.name}</div>
           <div class="urgency-track">
             <div class="urgency-fill ${colorClass}" style="width:${Math.max(pct, 4)}%">
-              <span class="urgency-date">${label}</span>
+              <span class="urgency-date">${stockoutLabel(x)}</span>
             </div>
           </div>
-          <div class="urgency-days">${hasDays ? x.days + 'd' : '✓'}</div>
+          <div class="urgency-days">${rightLabel}</div>
         </div>`;
     }).join('');
   }
@@ -274,7 +315,7 @@
       if (!families[p.family]) families[p.family] = { total: 0, critical: 0, out: 0 };
       families[p.family].total += p.available;
       if (p.available <= 0) families[p.family].out++;
-      else if (p.days !== null && p.days <= S.criticalDays) families[p.family].critical++;
+      else if (p.days !== null && !p.beyondForecast && p.days <= S.criticalDays) families[p.family].critical++;
     });
 
     document.getElementById('familyList').innerHTML = Object.entries(families).map(([name, f]) => `
@@ -296,7 +337,7 @@
   function renderAlerts() {
     const outOfStock = state.products.filter(x => x.available <= 0);
     const lowStock = state.products
-      .filter(x => x.available > 0 && x.days !== null && x.days <= S.lowDays)
+      .filter(x => x.available > 0 && !x.beyondForecast && x.days !== null && x.days <= S.lowDays)
       .sort((a, b) => a.days - b.days);
 
     const alerts = [...lowStock, ...outOfStock];
@@ -346,7 +387,10 @@
           const cls = item.stockoutWeekIdx !== null && item.stockoutWeekIdx <= 2 ? 'bar-red'
             : item.stockoutWeekIdx !== null && item.stockoutWeekIdx <= 4 ? 'bar-amber'
             : 'bar-green';
-          const label = item.stockoutDateStr || 'Beyond forecast';
+          const label = item.beyondForecast
+            ? `${item.forecastEndStock.toLocaleString()} units at ${item.forecastEndDate}`
+            : item.stockoutDateStr || '—';
+          const rightLabel = item.stockoutWeekIdx !== null ? 'Wk ' + (item.stockoutWeekIdx + 1) : '✓';
           return `
             <div class="urgency-row">
               <div class="urgency-label" title="${item.name}">${item.name}</div>
@@ -355,7 +399,7 @@
                   <span class="urgency-date">${label}</span>
                 </div>
               </div>
-              <div class="urgency-days">${item.stockoutWeekIdx !== null ? 'Wk ' + (item.stockoutWeekIdx + 1) : '✓'}</div>
+              <div class="urgency-days">${rightLabel}</div>
             </div>`;
         }).join('')}
       </div>`;
@@ -398,6 +442,9 @@
       .sort((a, b) => {
         if (a.available <= 0 && b.available > 0) return 1;
         if (b.available <= 0 && a.available > 0) return -1;
+        // Beyond forecast goes to bottom of healthy group
+        if (a.beyondForecast && !b.beyondForecast) return 1;
+        if (!a.beyondForecast && b.beyondForecast) return -1;
         if (a.days !== null && b.days !== null) return a.days - b.days;
         if (a.days === null && b.days !== null) return 1;
         if (b.days === null && a.days !== null) return -1;
@@ -407,7 +454,6 @@
     document.getElementById('skuBody').innerHTML = rows.map(p => {
       const isOut = p.available <= 0;
       const daysCell = isOut ? '—' : p.days !== null ? `${p.days}d` : '—';
-      const stockoutCell = isOut ? 'Out of stock' : p.stockoutDateStr || 'Beyond forecast';
       return `
         <tr>
           <td class="td-name">${p.name}</td>
@@ -417,7 +463,7 @@
           <td class="num">${Math.max(0, p.available + p.committed).toLocaleString()}</td>
           <td class="num">${p.deplRate ? p.deplRate.toFixed(1) : '—'}</td>
           <td class="num fw-500">${daysCell}</td>
-          <td class="num">${stockoutCell}</td>
+          <td class="num">${stockoutLabel(p)}</td>
           <td><span class="badge ${p.status.cls}">${p.status.label}</span></td>
         </tr>`;
     }).join('');
@@ -442,7 +488,9 @@
       const mainRows = await fetchRange(C.TABS.main, 'A:N');
 
       setLoader(true, 'Fetching depletion model...');
-      const deplRows = await fetchRange(C.TABS.depletion, 'A:V');
+      // Fetch up to forecastEndCol
+      const deplRange = `A:${C.DEPL_COLS.forecastEndCol}`;
+      const deplRows = await fetchRange(C.TABS.depletion, deplRange);
 
       const rawProducts = parseMain(mainRows);
       const deplData = parseDepletion(deplRows, rawProducts);
