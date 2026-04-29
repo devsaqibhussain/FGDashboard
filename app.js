@@ -24,12 +24,31 @@
     return isNaN(n) ? 0 : n;
   }
 
-  function daysStatus(days, available) {
+  // Status logic:
+  // - available <= 0           → Out / N/A (gray)
+  // - beyondForecast           → Healthy (green) — stocked past forecast window
+  // - days === null            → No forecast (gray)
+  // - days <= criticalDays     → Critical (red)
+  // - days <= lowDays          → Low (amber)
+  // - else                     → Healthy (green)
+  function daysStatus(days, available, beyondForecast) {
     if (available <= 0) return { label: 'Out / N/A', cls: 'badge-gray' };
+    if (beyondForecast) return { label: 'Healthy', cls: 'badge-green' };
     if (days === null) return { label: 'No forecast', cls: 'badge-gray' };
     if (days <= S.criticalDays) return { label: 'Critical', cls: 'badge-red' };
     if (days <= S.lowDays) return { label: 'Low', cls: 'badge-amber' };
     return { label: 'Healthy', cls: 'badge-green' };
+  }
+
+  // The label shown in the stockout/horizon column
+  // - beyondForecast: "[stock] units at [last forecast date]"
+  // - has stockout date: the date string
+  // - else: "—"
+  function stockoutLabel(p) {
+    if (p.available <= 0) return 'Out of stock';
+    if (p.beyondForecast) return `${p.forecastEndStock.toLocaleString()} units at ${p.forecastEndDate}`;
+    if (p.stockoutDateStr) return p.stockoutDateStr;
+    return '—';
   }
 
   function fmtDate(d) {
@@ -56,14 +75,12 @@
       const name = getCell(r, mc.productName);
       const status = getCell(r, mc.status);
       if (!name || status.toLowerCase() !== 'active') continue;
-
       const sku = getCell(r, mc.shopifyLink);
       const type = getCell(r, mc.type);
       const available = toNum(getCell(r, mc.available));
       const committed = toNum(getCell(r, mc.committed));
       const totalPipeline = toNum(getCell(r, mc.totalPipeline));
       const family = name.includes(' - ') ? name.split(' - ')[0].trim() : name;
-
       products.push({ name, sku, type, family, available, committed, totalPipeline });
     }
     return products;
@@ -71,9 +88,12 @@
 
   // ── Parse Depletion Model ────────────────────
   // Weekly values = stock remaining at END of that week.
-  // Stockout   = first week where stock hits 0 or goes negative.
-  // End of forecast = forecastEndCol in config — if stock is still positive
-  //   at that column, we show "[remaining units] units remaining at [last date]".
+  // forecastEndCol = the last column we care about (set in config).
+  // Stockout = first week where stock <= 0.
+  // If stock never hits 0 within the window → beyondForecast = true,
+  //   and we show the last week-end stock + its date.
+  // beyondForecast SKUs always get days = null so they never pollute
+  // the urgency/critical filters which sort by days.
   function parseDepletion(rows, currentProducts) {
     if (!rows.length) return { headers: [], items: [] };
 
@@ -81,7 +101,7 @@
     const weekStartIdx = colLetter(C.DEPL_COLS.weekStart);
     const forecastEndIdx = colLetter(C.DEPL_COLS.forecastEndCol);
 
-    // Slice headers only between weekStart and forecastEndCol (inclusive)
+    // Only consider columns within weekStart → forecastEndCol
     const dateHeaders = headerRow
       .slice(weekStartIdx, forecastEndIdx + 1)
       .map(h => h.trim())
@@ -105,7 +125,8 @@
 
       const avail = stockLookup[name] ?? null;
 
-      // Daily rate: current stock → first week-end value ÷ 7
+      // Daily rate: current stock → first week-end ÷ 7 (most accurate)
+      // Fall back to week-over-week diff if that's flat
       let deplRate = null;
       if (avail !== null && weekly.length > 0) {
         const thisWeekSales = avail - weekly[0];
@@ -118,7 +139,7 @@
         }
       }
 
-      // Find stockout week (first week where stock hits 0 or negative)
+      // Find first stockout week
       let stockoutWeekIdx = null;
       let stockoutDateStr = null;
       let daysUntilStockout = null;
@@ -131,7 +152,7 @@
         }
       }
 
-      // If stockout found — calculate calendar days to that date
+      // If stockout found → calculate calendar days to that date
       if (stockoutDateStr) {
         const stockoutD = new Date(stockoutDateStr);
         const today = new Date();
@@ -139,21 +160,20 @@
         daysUntilStockout = Math.max(0, Math.round((stockoutD - today) / (1000 * 60 * 60 * 24)));
       }
 
-      // If NO stockout found within forecast window — stock is healthy through the end
-      // Record the last week's remaining units and date so we can display it
+      // Beyond forecast: stock is still positive at the last column
+      // Show last week-end stock + its date. days stays null.
+      let beyondForecast = false;
       let forecastEndStock = null;
       let forecastEndDate = null;
+
       if (stockoutWeekIdx === null && weekly.length > 0) {
         const lastVal = weekly[weekly.length - 1];
-        const lastDate = dateHeaders[dateHeaders.length - 1];
         if (lastVal > 0) {
+          beyondForecast = true;
           forecastEndStock = lastVal;
-          forecastEndDate = lastDate;
-          // Estimate days using rate beyond forecast window
-          if (deplRate && deplRate > 0) {
-            daysUntilStockout = Math.round(lastVal / deplRate) +
-              Math.round((new Date(lastDate) - new Date()) / (1000 * 60 * 60 * 24));
-          }
+          forecastEndDate = dateHeaders[dateHeaders.length - 1] || null;
+          // days stays null for beyondForecast — intentional
+          daysUntilStockout = null;
         }
       }
 
@@ -165,9 +185,9 @@
         stockoutWeekIdx,
         stockoutDateStr,
         daysUntilStockout,
+        beyondForecast,
         forecastEndStock,
         forecastEndDate,
-        beyondForecast: stockoutWeekIdx === null && forecastEndStock !== null,
       });
     }
     return { headers: dateHeaders, items };
@@ -179,52 +199,48 @@
     deplItems.forEach(d => { deplMap[d.name] = d; });
 
     return products.map(p => {
+      // 0-stock → always Out/NA, no further calc
       if (p.available <= 0) {
         return {
           ...p,
           days: null,
           deplRate: deplMap[p.name]?.deplRate ?? null,
-          stockoutDateStr: 'Out of stock',
+          stockoutDateStr: null,
           beyondForecast: false,
           forecastEndStock: null,
           forecastEndDate: null,
-          status: daysStatus(null, 0),
+          status: daysStatus(null, 0, false),
         };
       }
 
       const depl = deplMap[p.name];
+
+      // No matching depletion row at all
       if (!depl) {
         return {
-          ...p, days: null, deplRate: null,
-          stockoutDateStr: null, beyondForecast: false,
-          forecastEndStock: null, forecastEndDate: null,
-          status: daysStatus(null, p.available),
+          ...p,
+          days: null,
+          deplRate: null,
+          stockoutDateStr: null,
+          beyondForecast: false,
+          forecastEndStock: null,
+          forecastEndDate: null,
+          status: daysStatus(null, p.available, false),
         };
       }
 
       return {
         ...p,
-        days: depl.daysUntilStockout,
+        days: depl.daysUntilStockout,           // null for beyondForecast
         deplRate: depl.deplRate,
         stockoutDateStr: depl.stockoutDateStr,
         stockoutWeekIdx: depl.stockoutWeekIdx,
         beyondForecast: depl.beyondForecast,
         forecastEndStock: depl.forecastEndStock,
         forecastEndDate: depl.forecastEndDate,
-        status: daysStatus(depl.daysUntilStockout, p.available),
+        status: daysStatus(depl.daysUntilStockout, p.available, depl.beyondForecast),
       };
     });
-  }
-
-  // ── Format the stockout/horizon label ─────────
-  // Used consistently across all views
-  function stockoutLabel(p) {
-    if (p.available <= 0) return 'Out of stock';
-    if (p.beyondForecast && p.forecastEndStock !== null) {
-      return `${p.forecastEndStock.toLocaleString()} units at ${p.forecastEndDate}`;
-    }
-    if (p.stockoutDateStr) return p.stockoutDateStr;
-    return '—';
   }
 
   // ── State ─────────────────────────────────────
@@ -240,10 +256,12 @@
   // ── Render: Metrics ───────────────────────────
   function renderMetrics() {
     const p = state.products;
-    const withForecast = p.filter(x => x.available > 0 && x.days !== null);
-    const critical = withForecast.filter(x => x.days <= S.criticalDays).length;
-    const low = withForecast.filter(x => x.days > S.criticalDays && x.days <= S.lowDays).length;
-    const healthy = withForecast.filter(x => x.days > S.lowDays).length;
+    // Only SKUs with a real days value (not beyondForecast, not out of stock)
+    const withDays = p.filter(x => x.available > 0 && !x.beyondForecast && x.days !== null);
+    const critical = withDays.filter(x => x.days <= S.criticalDays).length;
+    const low = withDays.filter(x => x.days > S.criticalDays && x.days <= S.lowDays).length;
+    const healthy = withDays.filter(x => x.days > S.lowDays).length
+                  + p.filter(x => x.beyondForecast).length;
     const outOfStock = p.filter(x => x.available <= 0).length;
     const totalStock = p.reduce((s, x) => s + x.available, 0);
 
@@ -272,19 +290,18 @@
   }
 
   // ── Render: Urgency chart ─────────────────────
+  // Order: critical/low (soonest first) → healthy with days → beyondForecast → out of stock excluded
   function renderUrgencyChart() {
-    // SKUs with a known stockout date — sorted soonest first
     const withDays = state.products
-      .filter(x => x.available > 0 && x.days !== null && !x.beyondForecast)
+      .filter(x => x.available > 0 && !x.beyondForecast && x.days !== null)
       .sort((a, b) => a.days - b.days);
 
-    // SKUs healthy beyond forecast window — sorted by remaining stock desc
     const beyond = state.products
-      .filter(x => x.available > 0 && x.beyondForecast)
+      .filter(x => x.beyondForecast)
       .sort((a, b) => (b.forecastEndStock || 0) - (a.forecastEndStock || 0));
 
     const items = [...withDays, ...beyond].slice(0, S.maxTimelineItems);
-    const maxDays = Math.max(...withDays.map(x => x.days), 1);
+    const maxDays = withDays.length > 0 ? Math.max(...withDays.map(x => x.days)) : 1;
 
     document.getElementById('urgencyChart').innerHTML = items.map(x => {
       const pct = x.beyondForecast
@@ -315,7 +332,8 @@
       if (!families[p.family]) families[p.family] = { total: 0, critical: 0, out: 0 };
       families[p.family].total += p.available;
       if (p.available <= 0) families[p.family].out++;
-      else if (p.days !== null && !p.beyondForecast && p.days <= S.criticalDays) families[p.family].critical++;
+      else if (!p.beyondForecast && p.days !== null && p.days <= S.criticalDays)
+        families[p.family].critical++;
     });
 
     document.getElementById('familyList').innerHTML = Object.entries(families).map(([name, f]) => `
@@ -440,11 +458,13 @@
       .filter(p => state.skuFilter === 'All' || p.family === state.skuFilter)
       .filter(p => !q || p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q))
       .sort((a, b) => {
+        // Out of stock → very bottom
         if (a.available <= 0 && b.available > 0) return 1;
         if (b.available <= 0 && a.available > 0) return -1;
-        // Beyond forecast goes to bottom of healthy group
+        // beyondForecast → healthy, goes after those with known days
         if (a.beyondForecast && !b.beyondForecast) return 1;
         if (!a.beyondForecast && b.beyondForecast) return -1;
+        // Sort by days ascending (soonest stockout first)
         if (a.days !== null && b.days !== null) return a.days - b.days;
         if (a.days === null && b.days !== null) return 1;
         if (b.days === null && a.days !== null) return -1;
@@ -453,7 +473,7 @@
 
     document.getElementById('skuBody').innerHTML = rows.map(p => {
       const isOut = p.available <= 0;
-      const daysCell = isOut ? '—' : p.days !== null ? `${p.days}d` : '—';
+      const daysCell = isOut || p.beyondForecast ? '—' : p.days !== null ? `${p.days}d` : '—';
       return `
         <tr>
           <td class="td-name">${p.name}</td>
@@ -488,7 +508,6 @@
       const mainRows = await fetchRange(C.TABS.main, 'A:N');
 
       setLoader(true, 'Fetching depletion model...');
-      // Fetch up to forecastEndCol
       const deplRange = `A:${C.DEPL_COLS.forecastEndCol}`;
       const deplRows = await fetchRange(C.TABS.depletion, deplRange);
 
