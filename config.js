@@ -38,22 +38,25 @@ window.FRAGRA_CONFIG = {
 
   // 5. Column mappings for Depletion Model tab
   DEPL_COLS: {
-    productName: 'A',   // Product name
-    status:      'B',   // Status
-    sku:         'C',   // SKU
-    // Weekly date columns start at D (or whatever your sheet uses)
-    // The app will auto-detect the weekly date headers starting from this column
-    weekStart:   'I',
+    productName:    'A',  // Product name
+    status:         'B',  // Status
+    sku:            'C',  // SKU
+    // First date column in your Depletion Model (e.g. 'D' if dates start at column D)
+    weekStart:      'I',
+    // Last column of your forecast window — set this to the last date column in your sheet
+    // SKUs that are still positive at this column will show: "[stock] units at [date]"
+    // Check your sheet: if your last date is in column V, set this to 'V'
+    forecastEndCol: 'AB',
   },
 
   // 6. Dashboard display settings
   SETTINGS: {
-    brandName:       'Fragra',
-    criticalDays:    14,   // ≤ this = Critical (red)
-    lowDays:         30,   // ≤ this = Low (amber)
-    dataStartRow:    4,    // Row where data begins (after headers)
-    deplDataStartRow: 2,   // Depletion model data start row
-    maxTimelineItems: 15,  // How many bars in the urgency chart
+    brandName:        'Fragra',
+    criticalDays:     14,   // ≤ this = Critical (red)
+    lowDays:          30,   // ≤ this = Low (amber)
+    dataStartRow:     4,    // Row where data begins (after headers)
+    deplDataStartRow: 2,    // Depletion model data start row
+    maxTimelineItems: 15,   // How many bars in the urgency chart
   },
 
 };
