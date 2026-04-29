@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fragra · Inventory Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@400;500&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- LOADER -->
+  <div id="loader">
+    <div class="loader-inner">
+      <div class="loader-logo">fragra</div>
+      <div class="loader-bar"><div class="loader-progress" id="loaderProgress"></div></div>
+      <div class="loader-msg" id="loaderMsg">Connecting to inventory...</div>
+    </div>
+  </div>
+
+  <!-- APP -->
+  <div id="app" style="display:none">
+
+    <aside class="sidebar">
+      <div class="sidebar-logo">fragra</div>
+      <nav class="sidebar-nav">
+        <a href="#" class="nav-item active" data-view="overview">
+          <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+          Overview
+        </a>
+        <a href="#" class="nav-item" data-view="depletion">
+          <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M3 17l4-8 4 4 4-6 4 4"/><path d="M3 21h18"/></svg>
+          Depletion
+        </a>
+        <a href="#" class="nav-item" data-view="skus">
+          <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M9 12h6M9 16h4"/></svg>
+          All SKUs
+        </a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="sync-label">Last synced</div>
+        <div class="sync-time" id="syncTime">—</div>
+        <button class="refresh-btn" onclick="window.dashboard.refresh()">
+          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 102.13-9.36L1 10"/></svg>
+          Refresh
+        </button>
+      </div>
+    </aside>
+
+    <main class="main">
+
+      <!-- OVERVIEW VIEW -->
+      <div id="view-overview" class="view active">
+        <header class="page-header">
+          <div>
+            <div class="page-eyebrow">Inventory Report</div>
+            <h1 class="page-title">Stock Overview</h1>
+          </div>
+          <div class="header-date" id="headerDate">—</div>
+        </header>
+
+        <div class="metrics-grid" id="metricsGrid"></div>
+
+        <div class="section">
+          <div class="section-header">
+            <div class="section-title">Urgency snapshot</div>
+            <div class="section-sub">SKUs sorted by days of stock remaining</div>
+          </div>
+          <div class="urgency-chart" id="urgencyChart"></div>
+        </div>
+
+        <div class="two-col">
+          <div class="section">
+            <div class="section-header">
+              <div class="section-title">Stock by product family</div>
+            </div>
+            <div class="family-list" id="familyList"></div>
+          </div>
+          <div class="section">
+            <div class="section-header">
+              <div class="section-title">Alerts</div>
+            </div>
+            <div class="alerts-list" id="alertsList"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- DEPLETION VIEW -->
+      <div id="view-depletion" class="view">
+        <header class="page-header">
+          <div>
+            <div class="page-eyebrow">Forecast</div>
+            <h1 class="page-title">Depletion Timeline</h1>
+          </div>
+          <div class="filter-row" id="deplFilters"></div>
+        </header>
+        <div class="section">
+          <div class="depletion-timeline" id="depletionTimeline"></div>
+        </div>
+        <div class="section">
+          <div class="section-header">
+            <div class="section-title">Weekly forecast table</div>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table" id="depletionTable">
+              <thead><tr id="deplTableHead"></tr></thead>
+              <tbody id="deplTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ALL SKUS VIEW -->
+      <div id="view-skus" class="view">
+        <header class="page-header">
+          <div>
+            <div class="page-eyebrow">Inventory</div>
+            <h1 class="page-title">All SKUs</h1>
+          </div>
+          <div class="search-wrap">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+            <input type="text" id="skuSearch" placeholder="Search product or SKU…" oninput="window.dashboard.filterSkus()" />
+          </div>
+        </header>
+        <div class="filter-pills" id="skuFilters"></div>
+        <div class="table-scroll">
+          <table class="data-table" id="skuTable">
+            <thead>
+              <tr>
+                <th>Product</th>
+                <th>SKU</th>
+                <th class="num">On hand</th>
+                <th class="num">Committed</th>
+                <th class="num">Net stock</th>
+                <th class="num">Daily rate</th>
+                <th class="num">Days left</th>
+                <th class="num">Stockout date</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="skuBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+  <!-- ERROR STATE -->
+  <div id="errorState" style="display:none" class="error-state">
+    <div class="error-inner">
+      <div class="error-icon">⚠</div>
+      <div class="error-title">Could not load data</div>
+      <div class="error-msg" id="errorMsg">Check your API key and Sheet ID in config.js</div>
+      <button onclick="window.dashboard.refresh()">Try again</button>
+    </div>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
